@@ -3,3 +3,4 @@ torch
 torchaudio
 tqdm
 soundfile
+pydub
