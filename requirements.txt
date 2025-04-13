@@ -2,3 +2,4 @@ demucs
 torch
 torchaudio
 tqdm
+soundfile
