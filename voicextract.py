@@ -41,6 +41,9 @@ class VocalExtractor:
             sample_rate: Abtastrate
             format: Ausgabeformat ("mp3" oder "wav")
             bitrate: Bitrate für MP3-Kompression
+
+        Returns:
+            Pfad der geschriebenen Datei
         """
         # Sicherstellen, dass das Verzeichnis existiert
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -87,6 +90,9 @@ class VocalExtractor:
             os.unlink(temp_wav_path)
         except Exception as e:
             print(f"Warnung: Konnte temporäre Datei nicht löschen: {e}")
+
+        # Tatsächlicher Pfad (kann bei MP3-Fehlschlag auf .wav ausgewichen sein)
+        return path
 
     def extract_vocals(self, input_file, output_dir, format="mp3", bitrate="192k"):
         """
@@ -138,16 +144,8 @@ class VocalExtractor:
                 all_vocals = []
                 all_accompaniment = []
 
-                # Berechne Anzahl der Segmente
-                total_samples = wav.shape[2]
-                segments = []
-
                 # Erstelle überlappende Segmente
-                start = 0
-                while start < total_samples:
-                    end = min(start + segment_samples, total_samples)
-                    segments.append((start, end))
-                    start += segment_samples - overlap_samples
+                segments = segment_bounds(wav.shape[2], segment_samples, overlap_samples)
 
                 print(f"Audio wird in {len(segments)} Segmenten verarbeitet")
 
@@ -181,9 +179,10 @@ class VocalExtractor:
                 accompaniment_output = self.crossfade_segments(all_accompaniment, overlap_samples)
 
                 # Speichern der Dateien
-                self.save_audio(vocal_output[0].numpy(), vocal_path, self.model.samplerate, format, bitrate)
-                self.save_audio(accompaniment_output[0].numpy(), accompaniment_path, self.model.samplerate, format,
-                                bitrate)
+                vocal_path = self.save_audio(vocal_output[0].numpy(), vocal_path, self.model.samplerate,
+                                             format, bitrate)
+                accompaniment_path = self.save_audio(accompaniment_output[0].numpy(), accompaniment_path,
+                                                     self.model.samplerate, format, bitrate)
             else:
                 # Verarbeite die gesamte Datei auf einmal
                 with torch.no_grad():
@@ -198,7 +197,7 @@ class VocalExtractor:
                 if vocal_idx != -1:
                     # Vocals speichern
                     vocals = sources[:, vocal_idx].cpu().numpy()
-                    self.save_audio(vocals[0], vocal_path, self.model.samplerate, format, bitrate)
+                    vocal_path = self.save_audio(vocals[0], vocal_path, self.model.samplerate, format, bitrate)
 
                     # Begleitung erstellen (alle Quellen außer vocals)
                     accompaniment = torch.zeros_like(sources[:, 0])
@@ -206,8 +205,8 @@ class VocalExtractor:
                         if idx != vocal_idx:
                             accompaniment += sources[:, idx]
 
-                    self.save_audio(accompaniment[0].cpu().numpy(), accompaniment_path, self.model.samplerate, format,
-                                    bitrate)
+                    accompaniment_path = self.save_audio(accompaniment[0].cpu().numpy(), accompaniment_path,
+                                                         self.model.samplerate, format, bitrate)
                 else:
                     print("Warnung: Keine Vocals-Stem gefunden in den verfügbaren Stems!")
                     return {}
@@ -254,7 +253,7 @@ class VocalExtractor:
             next_overlap = next_seg[:, :, :overlap_samples]
 
             # Überblendung berechnen
-            blended = fade_out.view(1, 1, -1) * curr_overlap + fade_in.view(1, 1, -1) * next_overlap
+            blended = fade_out.reshape(1, 1, -1) * curr_overlap + fade_in.reshape(1, 1, -1) * next_overlap
 
             # Anfügen an Ergebnis
             result = torch.cat([result, blended], dim=2)
@@ -282,14 +281,64 @@ class VocalExtractor:
             Dictionary mit Eingabedateien als Schlüssel und Ausgabepfaden als Werten
         """
         results = {}
+        used_names = set()
         for input_file in tqdm.tqdm(input_files, desc="Verarbeite Dateien"):
-            file_output_dir = os.path.join(output_dir, os.path.splitext(os.path.basename(input_file))[0])
+            file_output_dir = os.path.join(output_dir, unique_output_name(input_file, used_names))
             results[input_file] = self.extract_vocals(input_file, file_output_dir, format, bitrate)
 
         return results
 
 
-def main():
+AUDIO_EXTENSIONS = ['.mp3', '.wav', '.flac', '.ogg', '.m4a']
+
+
+def segment_bounds(total_samples, segment_samples, overlap_samples):
+    """
+    Teilt total_samples in Segmente der Länge segment_samples, die sich um
+    genau overlap_samples überlappen. Das letzte Segment endet bei total_samples.
+
+    Sobald ein Segment das Ende erreicht, ist Schluss: ein weiteres Segment läge
+    vollständig in dessen Überlappung, wäre kürzer als die Überblendung und
+    brachte crossfade_segments zum Absturz (Shape-Fehler).
+    """
+    if segment_samples <= overlap_samples:
+        raise ValueError("segment_samples muss größer als overlap_samples sein")
+    segments = []
+    start = 0
+    while start < total_samples:
+        end = min(start + segment_samples, total_samples)
+        segments.append((start, end))
+        if end == total_samples:
+            break
+        start += segment_samples - overlap_samples
+    return segments
+
+
+def unique_output_name(input_file, used_names):
+    """
+    Name des Ausgabeordners für eine Eingabedatei (Dateiname ohne Endung).
+
+    Gleichnamige Dateien (a/song.mp3 und b/song.mp3 bei -r, oder song.mp3 und
+    song.wav) bekommen " (2)", " (3)" ... angehängt, statt sich gegenseitig
+    zu überschreiben.
+    """
+    base = os.path.splitext(os.path.basename(input_file))[0]
+    name, n = base, 1
+    while name.lower() in used_names:
+        n += 1
+        name = f"{base} ({n})"
+    used_names.add(name.lower())
+    return name
+
+
+def find_audio_files(input_path, recursive=False):
+    """Sortierte Liste aller Audiodateien in einem Verzeichnis."""
+    pattern = '**/*' if recursive else '*'
+    return sorted(str(f) for f in Path(input_path).glob(pattern)
+                  if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS)
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description='VoiceXtract - Extrahiere Vocals aus Musikdateien')
     parser.add_argument('input', help='Eingabedatei oder Verzeichnis mit Audiodateien')
     parser.add_argument('-o', '--output', default='output', help='Ausgabeverzeichnis (Standard: output)')
@@ -301,7 +350,7 @@ def main():
     parser.add_argument('-s', '--segment', type=int,
                         help='Segmentgröße in Sekunden für Chunk-Verarbeitung (reduziert Speicherverbrauch)')
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # Überprüfe ob ffmpeg installiert ist, wenn MP3 als Format gewählt wurde
     if args.format.lower() == "mp3":
@@ -325,13 +374,7 @@ def main():
         print(f"Extrahierte Dateien: {result}")
     else:
         # Verzeichnis verarbeiten
-        audio_extensions = ['.mp3', '.wav', '.flac', '.ogg', '.m4a']
-
-        if args.recursive:
-            audio_files = [str(f) for f in input_path.glob('**/*') if
-                           f.is_file() and f.suffix.lower() in audio_extensions]
-        else:
-            audio_files = [str(f) for f in input_path.glob('*') if f.is_file() and f.suffix.lower() in audio_extensions]
+        audio_files = find_audio_files(input_path, args.recursive)
 
         if not audio_files:
             print(f"Keine Audiodateien in {input_path} gefunden.")
